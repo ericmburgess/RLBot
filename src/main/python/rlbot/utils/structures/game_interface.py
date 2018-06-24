@@ -121,7 +121,7 @@ class GameInterface:
                                                 None if self.extension is None else self.extension.onMatchStart), None)
 
         if rlbot_status != 0:
-            raise rlbot_exception.RLBotException().raise_exception_from_error_code(rlbot_status)
+            raise rlbot_exception.RLBotException().get_exception_from_error_code(rlbot_status)
 
         self.logger.debug('Starting match with status: %s', RLBotCoreStatus.status_list[rlbot_status])
 
