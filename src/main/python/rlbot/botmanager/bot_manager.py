@@ -2,15 +2,12 @@ import glob
 import os
 import time
 import traceback
-from datetime import datetime, timedelta
-import multiprocessing as mp
 from urllib.parse import ParseResult as URL
 
 from rlbot.agents.base_agent import BaseAgent
 from rlbot.botmanager.agent_metadata import AgentMetadata
 from rlbot.matchconfig.match_config import MatchConfig
 from rlbot.messages.flat import MatchSettings
-from rlbot.utils import rate_limiter
 from rlbot.utils.game_state_util import GameState
 from rlbot.utils.logging_utils import get_logger
 from rlbot.utils.rendering.rendering_manager import RenderingManager
@@ -20,8 +17,8 @@ from rlbot.utils.structures.game_interface import GameInterface
 from rlbot.utils.structures.game_status import RLBotCoreStatus
 from rlbot.utils.structures.quick_chats import send_quick_chat_flat
 
-GAME_TICK_PACKET_POLLS_PER_SECOND = 120  # 2*60. https://en.wikipedia.org/wiki/Nyquist_rate
-MAX_AGENT_CALL_PERIOD = timedelta(seconds=1.0 / 30)  # Minimum call rate when paused.
+GAME_TICK_PACKET_POLLS_PER_SECOND = 120
+MIN_AGENT_CALL_RATE = 30    # Minimum call rate when paused. Zero for no calls.
 REFRESH_IN_PROGRESS = 1
 REFRESH_NOT_IN_PROGRESS = 0
 MAX_CARS = 10
@@ -36,7 +33,6 @@ class BotManager:
         :param terminate_request_event: an Event (multiprocessing) which will be set from the outside when the program is trying to terminate
         :param termination_complete_event: an Event (multiprocessing) which should be set from inside this class when termination has completed successfully
         :param reload_request_event: an Event (multiprocessing) which will be set from the outside to force a reload of the agent
-        :param reload_complete_event: an Event (multiprocessing) which should be set from inside this class when reloading has completed successfully
         :param bot_configuration: parameters which will be passed to the bot's constructor
         :param name: name which will be passed to the bot's constructor. Will probably be displayed in-game.
         :param team: 0 for blue team or 1 for orange team. Will be passed to the bot's constructor.
@@ -124,15 +120,13 @@ class BotManager:
     def set_render_manager(self):
         """
         Sets the render manager for the agent.
-        :param agent: An instance of an agent.
         """
         rendering_manager = self.game_interface.renderer.get_rendering_manager(self.index, self.team)
         self.agent._set_renderer(rendering_manager)
 
     def update_metadata_queue(self):
         """
-        Adds a new instance of AgentMetadata into the `agent_metadata_queue` using `agent` data.
-        :param agent: An instance of an agent.
+        Adds a new instance of AgentMetadata into the `agent_metadata_queue` using agent data.
         """
         pids = {os.getpid(), *self.agent.get_extra_pids()}
 
@@ -159,58 +153,71 @@ class BotManager:
 
         self.prepare_for_run()
 
-        # Create Ratelimiter
-        rate_limit = rate_limiter.RateLimiter(GAME_TICK_PACKET_POLLS_PER_SECOND)
-        last_tick_game_time = None  # What the tick time of the last observed tick was
-        last_call_real_time = datetime.now()  # When we last called the Agent
+        tick_game_time = None
 
         # Get bot module
         self.load_agent()
 
         self.last_module_modification_time = self.check_modification_time(os.path.dirname(self.agent_class_file))
 
+        last_tick_ns = now = time.perf_counter_ns()
+        poll_period_ns = 10**9 / GAME_TICK_PACKET_POLLS_PER_SECOND
+        if MIN_AGENT_CALL_RATE == 0:
+            pause_period_ns = None
+        else:
+            pause_period_ns = 10**9 / MIN_AGENT_CALL_RATE
+
         # Run until main process tells to stop, or we detect Ctrl+C
         try:
             while not self.terminate_request_event.is_set():
-                self.pull_data_from_game()
-                # game_tick_packet = self.game_interface.get
-                # Read from game data shared memory
+                last_tick_game_time = tick_game_time
+                next_tick_ns = last_tick_ns + poll_period_ns
+                # Sleep nicely until about 2ms prior to the expected next update:
+                while next_tick_ns - time.perf_counter_ns() > 2e6:
+                    time.sleep(.001)
 
-                # Run the Agent only if the game_info has updated.
-                tick_game_time = self.get_game_time()
-                should_call_while_paused = datetime.now() - last_call_real_time >= MAX_AGENT_CALL_PERIOD
-                if tick_game_time != last_tick_game_time or should_call_while_paused:
-                    last_tick_game_time = tick_game_time
-                    last_call_real_time = datetime.now()
+                # Now poll rapidly to get the next tick as early as possible:
+                while tick_game_time == last_tick_game_time:
+                    now = time.perf_counter_ns()
+                    self.pull_data_from_game()
+                    tick_game_time = self.get_game_time()
+                    if now - last_tick_ns > 3e6:
+                        # Tick is late, start sleeping nicely again till we get it:
+                        time.sleep(.001)
+                    if pause_period_ns is not None:
+                        if now - last_tick_ns > pause_period_ns:
+                            # Call the bot even though info hasn't updated.
+                            break
+                last_tick_ns = now
 
-                    # Reload the Agent if it has been modified or if reload is requested from outside.
-                    if self.agent.is_hot_reload_enabled():
-                        self.hot_reload_if_necessary()
+                # Reload the Agent if it has been modified or if reload is requested from outside.
+                if self.agent.is_hot_reload_enabled():
+                    self.hot_reload_if_necessary()
 
-                    try:
-                        chat_messages = self.game_interface.receive_chat(self.index, self.team, self.last_message_index)
-                        for i in range(0, chat_messages.MessagesLength()):
-                            message = chat_messages.Messages(i)
-                            if len(self.match_config.player_configs) > message.PlayerIndex():
-                                self.agent.handle_quick_chat(
-                                    index=message.PlayerIndex(),
-                                    team=self.match_config.player_configs[message.PlayerIndex()].team,
-                                    quick_chat=message.QuickChatSelection())
-                            else:
-                                self.logger.debug(f"Skipping quick chat delivery for {message.MessageIndex()} because "
-                                                  "we don't recognize the player index. Probably stale.")
-                            self.last_message_index = message.MessageIndex()
-                    except EmptyDllResponse:
-                        self.logger.debug("Empty response when reading chat!")
+                try:
+                    chat_messages = self.game_interface.receive_chat(self.index, self.team, self.last_message_index)
+                    for i in range(0, chat_messages.MessagesLength()):
+                        message = chat_messages.Messages(i)
+                        if len(self.match_config.player_configs) > message.PlayerIndex():
+                            self.agent.handle_quick_chat(
+                                index=message.PlayerIndex(),
+                                team=self.match_config.player_configs[message.PlayerIndex()].team,
+                                quick_chat=message.QuickChatSelection())
+                        else:
+                            self.logger.debug(f"Skipping quick chat delivery for {message.MessageIndex()} because "
+                                              "we don't recognize the player index. Probably stale.")
+                        self.last_message_index = message.MessageIndex()
+                except EmptyDllResponse:
+                    self.logger.debug("Empty response when reading chat!")
 
-                    # Call agent
-                    try:
-                        self.call_agent(self.agent, self.agent_class_wrapper.get_loaded_class())
-                    except Exception as e:
-                        self.logger.error("Call to agent failed:\n" + traceback.format_exc())
+                # Call agent
+                try:
+                    self.call_agent(self.agent, self.agent_class_wrapper.get_loaded_class())
+                except KeyboardInterrupt:
+                    raise
+                except Exception:
+                    self.logger.error("Call to agent failed:\n" + traceback.format_exc())
 
-                # Ratelimit here
-                rate_limit.acquire()
         except KeyboardInterrupt:
             self.terminate_request_event.set()
 
@@ -241,7 +248,7 @@ class BotManager:
         if hasattr(agent, 'retire'):
             try:
                 agent.retire()
-            except Exception as e:
+            except Exception:
                 self.logger.error("Retiring the agent failed:\n" + traceback.format_exc())
         if hasattr(agent, 'renderer') and isinstance(agent.renderer, RenderingManager):
             agent.renderer.clear_all_touched_render_groups()
