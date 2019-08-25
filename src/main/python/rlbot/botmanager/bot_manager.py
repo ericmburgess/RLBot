@@ -24,6 +24,14 @@ REFRESH_NOT_IN_PROGRESS = 0
 MAX_CARS = 10
 
 
+# Maintain backward compatibility with Python 3.6:
+try:
+    from time import perf_counter_ns
+except ImportError:
+    def perf_counter_ns():
+        return time.perf_counter() * 1e9
+
+
 class BotManager:
 
     def __init__(self, terminate_request_event, termination_complete_event, reload_request_event, bot_configuration,
@@ -160,7 +168,7 @@ class BotManager:
 
         self.last_module_modification_time = self.check_modification_time(os.path.dirname(self.agent_class_file))
 
-        last_tick_ns = now = time.perf_counter_ns()
+        last_tick_ns = now = perf_counter_ns()
         poll_period_ns = 10**9 / GAME_TICK_PACKET_POLLS_PER_SECOND
         if MIN_AGENT_CALL_RATE == 0:
             pause_period_ns = None
@@ -178,12 +186,12 @@ class BotManager:
                     self.hot_reload_if_necessary()
 
                 # Sleep nicely until about 2ms prior to the expected next update:
-                while next_tick_ns - time.perf_counter_ns() > 2e6:
+                while next_tick_ns - perf_counter_ns() > 2e6:
                     time.sleep(.001)
 
                 # Now poll rapidly to get the next tick as early as possible:
                 while tick_game_time == last_tick_game_time:
-                    now = time.perf_counter_ns()
+                    now = perf_counter_ns()
                     self.pull_data_from_game()
                     tick_game_time = self.get_game_time()
                     if now - last_tick_ns > 3e6:
@@ -262,14 +270,14 @@ class BotManager:
 
     def check_modification_time(self, directory, timeout_ms=1):
         if self.scan_last > 0 and timeout_ms is not None:
-            stop_time = time.perf_counter_ns() + timeout_ms * 10**6
+            stop_time = perf_counter_ns() + timeout_ms * 10**6
         else:
             stop_time = None
         if self.file_iterator is None:
             self.file_iterator = glob.iglob(f"{directory}/**/*.py", recursive=True)
         for f in self.file_iterator:
             self.scan_temp = max(self.scan_temp, os.stat(f).st_mtime)
-            if stop_time is not None and time.perf_counter_ns() > stop_time:
+            if stop_time is not None and perf_counter_ns() > stop_time:
                 # Timeout exceeded. The scan will pick up from here on the next call.
                 break
         else:
